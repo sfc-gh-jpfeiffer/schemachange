@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import dsa
 from cryptography.hazmat.primitives import serialization
 
 # Set a few global variables here
-_schemachange_version = '3.4.2'
+_schemachange_version = '3.4.3'
 _config_file_name = 'schemachange-config.yml'
 _metadata_database_name = 'METADATA'
 _metadata_schema_name = 'SCHEMACHANGE'
@@ -142,17 +142,13 @@ class SecretManager:
 
 def deploy_command(config):
   # Make sure we have the required configs
-  if not config['snowflake-account'] or not config['snowflake-user'] or not config['snowflake-role'] or not config['snowflake-warehouse']:
-    raise ValueError("Missing config values. The following config values are required: snowflake-account, snowflake-user, snowflake-role, snowflake-warehouse")
-
-  # Password authentication will take priority
-  # We will accept SNOWSQL_PWD for now, but it is deprecated
-  if "SNOWFLAKE_PASSWORD" not in os.environ and "SNOWSQL_PWD" not in os.environ and "SNOWFLAKE_PRIVATE_KEY_PATH" not in os.environ:
-    raise ValueError("Missing environment variable(s). SNOWFLAKE_PASSWORD must be defined for password authentication. SNOWFLAKE_PRIVATE_KEY_PATH and (optional) SNOWFLAKE_PRIVATE_KEY_PASSPHRASE must be defined for private key authentication.")
+  if not config['snowflake-authenticator'] or not config['snowflake-account'] or not config['snowflake-user'] or not config['snowflake-role'] or not config['snowflake-warehouse']:
+    raise ValueError("Missing config values. The following config values are required: snowflake-authenticator, snowflake-account, snowflake-user, snowflake-role, snowflake-warehouse")
 
   # Log some additional details
   if config['dry-run']:
     print("Running in dry-run mode")
+  print("Using authenticator %s" % config['snowflake-authenticator'])
   print("Using Snowflake account %s" % config['snowflake-account'])
   print("Using default role %s" % config['snowflake-role'])
   print("Using default warehouse %s" % config['snowflake-warehouse'])
@@ -170,8 +166,20 @@ def deploy_command(config):
   os.environ["SNOWFLAKE_USER"] = config['snowflake-user']
   os.environ["SNOWFLAKE_ROLE"] = config['snowflake-role']
   os.environ["SNOWFLAKE_WAREHOUSE"] = config['snowflake-warehouse']
-  os.environ["SNOWFLAKE_AUTHENTICATOR"] = 'snowflake'
+  os.environ["SNOWFLAKE_AUTHENTICATOR"] = config['snowflake-authenticator']
+  if config['snowflake-oauth-access-token']:
+    os.environ["SNOWFLAKE_OAUTH_ACCESS_TOKEN"] = config['snowflake-oauth-access-token']
+  # os.environ["SNOWFLAKE_AUTHENTICATOR"] = 'snowflake'
 
+  if "SNOWFLAKE_AUTHENTICATOR" not in os.environ:
+    raise ValueError("Missing environment variable(s). SNOWFLAKE_AUTHENTICATOR must be defined.")
+  # Password authentication will take priority
+  # We will accept SNOWSQL_PWD for now, but it is deprecated
+  elif os.environ["SNOWFLAKE_AUTHENTICATOR"] == "snowflake" and ("SNOWFLAKE_PASSWORD" not in os.environ and "SNOWSQL_PWD" not in os.environ and "SNOWFLAKE_PRIVATE_KEY_PATH" not in os.environ):
+    raise ValueError("Missing environment variable(s). SNOWFLAKE_PASSWORD must be defined for password authentication. SNOWFLAKE_PRIVATE_KEY_PATH and (optional) SNOWFLAKE_PRIVATE_KEY_PASSPHRASE must be defined for private key authentication.")
+  elif os.environ["SNOWFLAKE_AUTHENTICATOR"] == "oauth" and ("SNOWFLAKE_OAUTH_ACCESS_TOKEN" not in os.environ):
+    raise ValueError("Missing environment variable(s). SNOWFLAKE_OAUTH_ACCESS_TOKEN must be defined for oauth authentication.")
+  
   scripts_skipped = 0
   scripts_applied = 0
 
@@ -308,7 +316,7 @@ def load_schemachange_config(config_file_path: str) -> Dict[str, Any]:
   return config
 
 
-def get_schemachange_config(config_file_path, root_folder, modules_folder, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run, query_tag):
+def get_schemachange_config(config_file_path, root_folder, modules_folder, snowflake_authenticator, snowflake_oauth_access_token, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run, query_tag):
   config = load_schemachange_config(config_file_path)
 
   # First the folder paths
@@ -331,6 +339,16 @@ def get_schemachange_config(config_file_path, root_folder, modules_folder, snowf
       raise ValueError("Invalid modules folder: %s" % config['modules-folder'])
 
   # Then the remaining configs
+  if snowflake_authenticator:
+    config['snowflake-authenticator'] = snowflake_authenticator
+  if 'snowflake-authenticator' not in config:
+    config['snowflake-authenticator'] = 'snowflake'
+
+  if snowflake_oauth_access_token:
+    config['snowflake-oauth-access-token'] = snowflake_oauth_access_token
+  if 'snowflake-oauth-access-token' not in config:
+    config['snowflake-oauth-access-token'] = None
+
   if snowflake_account:
     config['snowflake-account'] = snowflake_account
   if 'snowflake-account' not in config:
@@ -467,53 +485,83 @@ def get_all_scripts_recursively(root_directory, verbose):
   return all_files
 
 def execute_snowflake_query(snowflake_database, query, snowflake_session_parameters, autocommit, verbose):
-  # Password authentication is the default
-  snowflake_password = None
-  if os.getenv("SNOWFLAKE_PASSWORD") is not None and os.getenv("SNOWFLAKE_PASSWORD"):
-    snowflake_password = os.getenv("SNOWFLAKE_PASSWORD")
-  elif os.getenv("SNOWSQL_PWD") is not None and os.getenv("SNOWSQL_PWD"):  # Check legacy/deprecated env variable
-    snowflake_password = os.getenv("SNOWSQL_PWD")
-    warnings.warn("The SNOWSQL_PWD environment variable is deprecated and will be removed in a later version of schemachange. Please use SNOWFLAKE_PASSWORD instead.", DeprecationWarning)
+  if os.getenv("SNOWFLAKE_AUTHENTICATOR", '') == 'snowflake':
+    # Password authentication is the default
+    snowflake_password = None
+    if os.getenv("SNOWFLAKE_PASSWORD") is not None and os.getenv("SNOWFLAKE_PASSWORD"):
+      snowflake_password = os.getenv("SNOWFLAKE_PASSWORD")
+    elif os.getenv("SNOWSQL_PWD") is not None and os.getenv("SNOWSQL_PWD"):  # Check legacy/deprecated env variable
+      snowflake_password = os.getenv("SNOWSQL_PWD")
+      warnings.warn("The SNOWSQL_PWD environment variable is deprecated and will be removed in a later version of schemachange. Please use SNOWFLAKE_PASSWORD instead.", DeprecationWarning)
 
-  if snowflake_password is not None:
-    if verbose:
-      print("Proceeding with password authentication")
-
-    con = snowflake.connector.connect(
-      user = os.environ["SNOWFLAKE_USER"],
-      account = os.environ["SNOWFLAKE_ACCOUNT"],
-      role = os.environ["SNOWFLAKE_ROLE"],
-      warehouse = os.environ["SNOWFLAKE_WAREHOUSE"],
-      database = snowflake_database,
-      authenticator = os.environ["SNOWFLAKE_AUTHENTICATOR"],
-      password = snowflake_password,
-      application = _snowflake_application_name,
-      session_parameters = snowflake_session_parameters
-    )
-  # If no password, try private key authentication
-  elif os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", ''):
-    if verbose:
-      print("Proceeding with private key authentication")
-
-    private_key_password = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", '')
-    if private_key_password:
-      private_key_password = private_key_password.encode()
-    else:
-      private_key_password = None
+    if snowflake_password is not None:
       if verbose:
-        print("No private key passphrase provided. Assuming the key is not encrypted.")
-    with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as key:
-      p_key= serialization.load_pem_private_key(
-          key.read(),
-          password = private_key_password,
-          backend = default_backend()
+        print("Proceeding with password authentication")
+
+      con = snowflake.connector.connect(
+        user = os.environ["SNOWFLAKE_USER"],
+        account = os.environ["SNOWFLAKE_ACCOUNT"],
+        role = os.environ["SNOWFLAKE_ROLE"],
+        warehouse = os.environ["SNOWFLAKE_WAREHOUSE"],
+        database = snowflake_database,
+        authenticator = os.environ["SNOWFLAKE_AUTHENTICATOR"],
+        password = snowflake_password,
+        application = _snowflake_application_name,
+        session_parameters = snowflake_session_parameters
       )
+    # If no password, try private key authentication
+    elif os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", ''):
+      if verbose:
+        print("Proceeding with private key authentication")
 
-    pkb = p_key.private_bytes(
-        encoding = serialization.Encoding.DER,
-        format = serialization.PrivateFormat.PKCS8,
-        encryption_algorithm = serialization.NoEncryption())
+      private_key_password = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", '')
+      if private_key_password:
+        private_key_password = private_key_password.encode()
+      else:
+        private_key_password = None
+        if verbose:
+          print("No private key passphrase provided. Assuming the key is not encrypted.")
+      with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as key:
+        p_key= serialization.load_pem_private_key(
+            key.read(),
+            password = private_key_password,
+            backend = default_backend()
+        )
 
+      pkb = p_key.private_bytes(
+          encoding = serialization.Encoding.DER,
+          format = serialization.PrivateFormat.PKCS8,
+          encryption_algorithm = serialization.NoEncryption())
+
+      con = snowflake.connector.connect(
+        user = os.environ["SNOWFLAKE_USER"],
+        account = os.environ["SNOWFLAKE_ACCOUNT"],
+        role = os.environ["SNOWFLAKE_ROLE"],
+        warehouse = os.environ["SNOWFLAKE_WAREHOUSE"],
+        database = snowflake_database,
+        authenticator = os.environ["SNOWFLAKE_AUTHENTICATOR"],
+        application = _snowflake_application_name,
+        private_key = pkb,
+        session_parameters = snowflake_session_parameters
+      )
+    else:
+      raise ValueError("Unable to find connection credentials for private key or password authentication")
+  elif os.getenv("SNOWFLAKE_AUTHENTICATOR", '') == 'oauth':
+    if os.getenv("SNOWFLAKE_OAUTH_ACCESS_TOKEN", ''):
+      con = snowflake.connector.connect(
+        user = os.environ["SNOWFLAKE_USER"],
+        account = os.environ["SNOWFLAKE_ACCOUNT"],
+        role = os.environ["SNOWFLAKE_ROLE"],
+        warehouse = os.environ["SNOWFLAKE_WAREHOUSE"],
+        database = snowflake_database,
+        authenticator = os.environ["SNOWFLAKE_AUTHENTICATOR"],
+        application = _snowflake_application_name,
+        token = os.environ["SNOWFLAKE_OAUTH_ACCESS_TOKEN"],
+        session_parameters = snowflake_session_parameters
+      )
+    else:
+      raise ValueError("Unable to find connection oauth token")
+  elif os.getenv("SNOWFLAKE_AUTHENTICATOR", '') == 'externalbrowser':
     con = snowflake.connector.connect(
       user = os.environ["SNOWFLAKE_USER"],
       account = os.environ["SNOWFLAKE_ACCOUNT"],
@@ -522,11 +570,10 @@ def execute_snowflake_query(snowflake_database, query, snowflake_session_paramet
       database = snowflake_database,
       authenticator = os.environ["SNOWFLAKE_AUTHENTICATOR"],
       application = _snowflake_application_name,
-      private_key = pkb,
       session_parameters = snowflake_session_parameters
     )
   else:
-    raise ValueError("Unable to find connection credentials for private key or password authentication")
+    raise ValueError("No authenticator provided")
 
   if not autocommit:
     con.autocommit(False)
@@ -692,6 +739,8 @@ def main(argv=sys.argv):
   parser_deploy.add_argument('--config-folder', type = str, default = '.', help = 'The folder to look in for the schemachange-config.yml file (the default is the current working directory)', required = False)
   parser_deploy.add_argument('-f', '--root-folder', type = str, help = 'The root folder for the database change scripts', required = False)
   parser_deploy.add_argument('-m', '--modules-folder', type = str, help = 'The modules folder for jinja macros and templates to be used across multiple scripts', required = False)
+  parser_deploy.add_argument('-au', '--snowflake-authenticator', type = str, help = 'The authenticator method (default is snowflake)', required = False)
+  parser_deploy.add_argument('-ot', '--snowflake-oauth-access-token', type = str, help = 'The oauth token)', required = False)
   parser_deploy.add_argument('-a', '--snowflake-account', type = str, help = 'The name of the snowflake account (e.g. xy12345.east-us-2.azure)', required = False)
   parser_deploy.add_argument('-u', '--snowflake-user', type = str, help = 'The name of the snowflake user', required = False)
   parser_deploy.add_argument('-r', '--snowflake-role', type = str, help = 'The name of the default role to use', required = False)
@@ -726,9 +775,9 @@ def main(argv=sys.argv):
   # First get the config values
   config_file_path = os.path.join(args.config_folder, _config_file_name)
   if args.subcommand == 'render':
-    config = get_schemachange_config(config_file_path, args.root_folder, args.modules_folder, None, None, None, None, None, None, args.vars, None, None, args.verbose, None, None)
+    config = get_schemachange_config(config_file_path, args.root_folder, args.modules_folder, None, None, None, None, None, None, None, None, args.vars, None, None, args.verbose, None, None)
   else:
-    config = get_schemachange_config(config_file_path, args.root_folder, args.modules_folder, args.snowflake_account, args.snowflake_user, args.snowflake_role, args.snowflake_warehouse, args.snowflake_database, args.change_history_table, args.vars, args.create_change_history_table, args.autocommit, args.verbose, args.dry_run, args.query_tag)
+    config = get_schemachange_config(config_file_path, args.root_folder, args.modules_folder, args.snowflake_authenticator, args.snowflake_oauth_access_token, args.snowflake_account, args.snowflake_user, args.snowflake_role, args.snowflake_warehouse, args.snowflake_database, args.change_history_table, args.vars, args.create_change_history_table, args.autocommit, args.verbose, args.dry_run, args.query_tag)
 
   # setup a secret manager and assign to global scope
   sm = SecretManager()
